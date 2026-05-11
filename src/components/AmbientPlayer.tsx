@@ -1,13 +1,9 @@
 import { useEffect, useRef, useState } from "react";
 import { Volume2, VolumeX, Music2 } from "lucide-react";
+import { audioLevel } from "@/lib/audioLevel";
 
-/**
- * Layered ambient music using the Web Audio API.
- * Multiple "instruments" (violin pad, flute lead, soft piano arpeggio, sub bass)
- * play together to form a slight, clear, cinematic piece.
- * Auto-starts on first user interaction (browser autoplay policy);
- * floating control toggles mute/play.
- */
+const LS_MUTED = "kmm.ambient.muted";
+const LS_VOLUME = "kmm.ambient.volume";
 
 type Voice = { stop: () => void };
 
@@ -32,7 +28,6 @@ function makeReverb(ctx: AudioContext, seconds = 2.4, decay = 2.2) {
   return conv;
 }
 
-/** Sustained violin-like voice (sawtooth + vibrato + slow swell). */
 function violin(ctx: AudioContext, dest: AudioNode, freq: number, dur: number, vol = 0.05): Voice {
   const t0 = ctx.currentTime;
   const osc1 = ctx.createOscillator(); osc1.type = "sawtooth"; osc1.frequency.value = freq; osc1.detune.value = -6;
@@ -50,7 +45,6 @@ function violin(ctx: AudioContext, dest: AudioNode, freq: number, dur: number, v
   return { stop: () => { try { osc1.stop(); osc2.stop(); lfo.stop(); } catch {} } };
 }
 
-/** Soft flute-like voice (sine + breath noise). */
 function flute(ctx: AudioContext, dest: AudioNode, freq: number, dur: number, vol = 0.06) {
   const t0 = ctx.currentTime;
   const osc = ctx.createOscillator(); osc.type = "sine"; osc.frequency.value = freq;
@@ -65,7 +59,6 @@ function flute(ctx: AudioContext, dest: AudioNode, freq: number, dur: number, vo
   osc.stop(t0 + dur + 0.05); sub.stop(t0 + dur + 0.05);
 }
 
-/** Plucked piano-like voice (FM-ish quick decay). */
 function piano(ctx: AudioContext, dest: AudioNode, freq: number, when = 0, vol = 0.09) {
   const t = ctx.currentTime + when;
   const osc = ctx.createOscillator(); osc.type = "triangle"; osc.frequency.value = freq;
@@ -80,7 +73,6 @@ function piano(ctx: AudioContext, dest: AudioNode, freq: number, when = 0, vol =
   osc.stop(t + 1.7); harm.stop(t + 1.7);
 }
 
-/** Deep sub bass drone. */
 function bass(ctx: AudioContext, dest: AudioNode, freq: number, dur: number, vol = 0.07) {
   const t0 = ctx.currentTime;
   const osc = ctx.createOscillator(); osc.type = "sine"; osc.frequency.value = freq;
@@ -98,34 +90,40 @@ export function AmbientPlayer() {
   const dryRef = useRef<GainNode | null>(null);
   const loopRef = useRef<number | null>(null);
   const startedRef = useRef(false);
-  const [playing, setPlaying] = useState(false);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const rafRef = useRef<number | null>(null);
+  const playingRef = useRef(false);
 
-  // 4-bar progression in D minor: Dm – F – Bb – A
+  const [playing, setPlaying] = useState(false);
+  const [volume, setVolume] = useState<number>(() => {
+    if (typeof window === "undefined") return 0.7;
+    const v = window.localStorage.getItem(LS_VOLUME);
+    const n = v ? parseFloat(v) : 0.7;
+    return Number.isFinite(n) ? Math.min(1, Math.max(0, n)) : 0.7;
+  });
+  const [userMuted, setUserMuted] = useState<boolean | null>(() => {
+    if (typeof window === "undefined") return null;
+    const v = window.localStorage.getItem(LS_MUTED);
+    return v === null ? null : v === "1";
+  });
+
   const progression = [
     { root: NOTE.D3, chord: ["D4", "F4", "A4"], lead: ["A4", "F4", "D5", "F4"] },
     { root: NOTE.F3, chord: ["F4", "A4", "C5"], lead: ["C5", "A4", "F4", "A4"] },
-    { root: NOTE.A3 / 1, chord: ["D4", "F4", "A4"], lead: ["D5", "C5", "A4", "F4"] },
+    { root: NOTE.A3, chord: ["D4", "F4", "A4"], lead: ["D5", "C5", "A4", "F4"] },
     { root: NOTE.A3, chord: ["E4", "A4", "C5"], lead: ["E5", "C5", "A4", "E4"] },
   ];
 
   const scheduleBar = (barIdx: number) => {
     const ctx = ctxRef.current!; const wet = wetRef.current!; const dry = dryRef.current!;
     const bar = progression[barIdx % progression.length];
-    const barLen = 6.4; // seconds per bar
-
-    // Bass drone for the whole bar (dry + a touch of wet)
+    const barLen = 6.4;
     bass(ctx, dry, bar.root / 2, barLen, 0.05);
-
-    // Violin pad — sustains the chord
     bar.chord.forEach((n, i) => violin(ctx, wet, NOTE[n], barLen, 0.035 - i * 0.005));
-
-    // Piano arpeggio — gentle, on the beats
     bar.lead.forEach((n, i) => piano(ctx, wet, NOTE[n], i * (barLen / 4), 0.07));
-
-    // Flute counter-melody at bar's halfway point
     const fluteNote = bar.lead[1];
     setTimeout(() => {
-      if (!playing && !startedRef.current) return;
+      if (!playingRef.current) return;
       flute(ctx, wet, NOTE[fluteNote] * 2, 2.2, 0.04);
     }, (barLen / 2) * 1000);
   };
@@ -144,11 +142,38 @@ export function AmbientPlayer() {
     if (loopRef.current) { clearInterval(loopRef.current); loopRef.current = null; }
   };
 
+  const startAnalyserLoop = () => {
+    if (rafRef.current) return;
+    const analyser = analyserRef.current;
+    if (!analyser) return;
+    const data = new Uint8Array(analyser.frequencyBinCount);
+    const tick = () => {
+      analyser.getByteTimeDomainData(data);
+      let sum = 0;
+      for (let i = 0; i < data.length; i++) {
+        const v = (data[i] - 128) / 128;
+        sum += v * v;
+      }
+      const rms = Math.sqrt(sum / data.length);
+      const lvl = Math.min(1, rms * 3.2);
+      audioLevel.set(lvl, true);
+      rafRef.current = requestAnimationFrame(tick);
+    };
+    rafRef.current = requestAnimationFrame(tick);
+  };
+
+  const stopAnalyserLoop = () => {
+    if (rafRef.current) { cancelAnimationFrame(rafRef.current); rafRef.current = null; }
+    audioLevel.set(0, false);
+  };
+
   const start = () => {
     if (startedRef.current && ctxRef.current) {
       ctxRef.current.resume();
-      masterRef.current?.gain.linearRampToValueAtTime(0.7, ctxRef.current.currentTime + 1.2);
+      masterRef.current?.gain.linearRampToValueAtTime(volume, ctxRef.current.currentTime + 1.2);
       if (!loopRef.current) startLoop();
+      startAnalyserLoop();
+      playingRef.current = true;
       setPlaying(true);
       return;
     }
@@ -160,18 +185,25 @@ export function AmbientPlayer() {
     const master = ctx.createGain(); master.gain.value = 0; masterRef.current = master;
     const comp = ctx.createDynamicsCompressor();
     comp.threshold.value = -20; comp.knee.value = 22; comp.ratio.value = 3.5;
-    master.connect(comp).connect(ctx.destination);
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 1024;
+    analyser.smoothingTimeConstant = 0.82;
+    analyserRef.current = analyser;
+    master.connect(comp);
+    comp.connect(analyser);
+    comp.connect(ctx.destination);
 
-    // dry + wet (reverb) buses
     const dry = ctx.createGain(); dry.gain.value = 0.85; dryRef.current = dry;
     const wet = ctx.createGain(); wet.gain.value = 0.55; wetRef.current = wet;
     const reverb = makeReverb(ctx, 3, 2.2);
     dry.connect(master);
     wet.connect(reverb).connect(master);
 
-    master.gain.linearRampToValueAtTime(0.7, ctx.currentTime + 2.5);
+    master.gain.linearRampToValueAtTime(volume, ctx.currentTime + 2.5);
+    playingRef.current = true;
     setPlaying(true);
     startLoop();
+    startAnalyserLoop();
   };
 
   const stop = () => {
@@ -180,17 +212,21 @@ export function AmbientPlayer() {
     master.gain.cancelScheduledValues(ctx.currentTime);
     master.gain.linearRampToValueAtTime(0, ctx.currentTime + 0.5);
     stopLoop();
+    stopAnalyserLoop();
     setTimeout(() => ctx.suspend().catch(() => {}), 600);
+    playingRef.current = false;
     setPlaying(false);
   };
 
-  // Auto-start on first user interaction (autoplay policy compliant)
+  // Auto-start on first user interaction unless user previously chose mute
   useEffect(() => {
     const handler = () => {
-      if (!startedRef.current) start();
+      if (!startedRef.current && userMuted !== true) start();
       window.removeEventListener("pointerdown", handler);
       window.removeEventListener("keydown", handler);
       window.removeEventListener("touchstart", handler);
+      window.removeEventListener("scroll", handler);
+      window.removeEventListener("wheel", handler);
     };
     window.addEventListener("pointerdown", handler);
     window.addEventListener("keydown", handler);
@@ -205,37 +241,87 @@ export function AmbientPlayer() {
       window.removeEventListener("wheel", handler);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [userMuted]);
+
+  useEffect(() => () => {
+    stopLoop();
+    stopAnalyserLoop();
+    ctxRef.current?.close().catch(() => {});
   }, []);
 
-  useEffect(() => () => { stopLoop(); ctxRef.current?.close().catch(() => {}); }, []);
+  // Persist + apply volume changes live
+  useEffect(() => {
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem(LS_VOLUME, String(volume));
+    }
+    const ctx = ctxRef.current; const master = masterRef.current;
+    if (ctx && master && playing) {
+      master.gain.cancelScheduledValues(ctx.currentTime);
+      master.gain.linearRampToValueAtTime(volume, ctx.currentTime + 0.15);
+    }
+  }, [volume, playing]);
 
-  const toggle = () => (playing ? stop() : start());
+  const toggle = () => {
+    if (playing) {
+      stop();
+      setUserMuted(true);
+      window.localStorage.setItem(LS_MUTED, "1");
+    } else {
+      start();
+      setUserMuted(false);
+      window.localStorage.setItem(LS_MUTED, "0");
+    }
+  };
 
   return (
-    <button
-      onClick={toggle}
-      data-cursor="hover"
-      aria-label={playing ? "Mute ambient music" : "Play ambient music"}
-      title={playing ? "Mute ambient music" : "Play ambient music"}
-      className="fixed bottom-6 left-6 z-50 inline-flex h-12 w-12 items-center justify-center rounded-full glass border border-border/60 hover:border-primary/60 transition-colors glow-violet"
-    >
-      {playing ? (
-        <Music2 className="h-5 w-5 text-foreground animate-pulse" />
-      ) : (
-        <VolumeX className="h-5 w-5 text-muted-foreground" />
-      )}
-      {playing && (
-        <span className="absolute inset-0 rounded-full animate-ping border border-primary/40" />
-      )}
-      <span className="sr-only">{playing ? "Mute" : "Play"} ambient music</span>
-      {/* status dot */}
-      <span
-        className={`absolute -top-1 -right-1 h-3 w-3 rounded-full border border-background ${
-          playing ? "bg-highlight" : "bg-muted-foreground/60"
-        }`}
-        aria-hidden
-      />
-      <Volume2 className="hidden" />
-    </button>
+    <div className="fixed bottom-6 left-6 z-50 flex items-center gap-2">
+      <button
+        onClick={toggle}
+        data-cursor="hover"
+        aria-label={playing ? "Mute ambient music" : "Play ambient music"}
+        title={playing ? "Mute ambient music" : "Play ambient music"}
+        className="relative inline-flex h-12 w-12 items-center justify-center rounded-full glass border border-border/60 hover:border-primary/60 transition-colors glow-violet"
+      >
+        {playing ? (
+          <Music2 className="h-5 w-5 text-foreground animate-pulse" />
+        ) : (
+          <VolumeX className="h-5 w-5 text-muted-foreground" />
+        )}
+        {playing && (
+          <span className="absolute inset-0 rounded-full animate-ping border border-primary/40" />
+        )}
+        <span className="sr-only">{playing ? "Mute" : "Play"} ambient music</span>
+        <span
+          className={`absolute -top-1 -right-1 h-3 w-3 rounded-full border border-background ${
+            playing ? "bg-highlight" : "bg-muted-foreground/60"
+          }`}
+          aria-hidden
+        />
+      </button>
+
+      <div className="glass border border-border/60 rounded-full px-3 h-12 flex items-center gap-3">
+        <span
+          className={`text-[11px] font-semibold tracking-wider uppercase ${
+            playing ? "text-highlight" : "text-muted-foreground"
+          }`}
+          aria-live="polite"
+        >
+          {playing ? "Playing" : "Muted"}
+        </span>
+        <div className="flex items-center gap-2">
+          <Volume2 className="h-3.5 w-3.5 text-muted-foreground" />
+          <input
+            type="range"
+            min={0}
+            max={1}
+            step={0.01}
+            value={volume}
+            onChange={(e) => setVolume(parseFloat(e.target.value))}
+            aria-label="Music volume"
+            className="w-24 accent-primary cursor-pointer"
+          />
+        </div>
+      </div>
+    </div>
   );
 }
