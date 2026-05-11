@@ -195,10 +195,14 @@ export function AmbientPlayer() {
     window.addEventListener("pointerdown", handler);
     window.addEventListener("keydown", handler);
     window.addEventListener("touchstart", handler);
+    window.addEventListener("scroll", handler, { passive: true });
+    window.addEventListener("wheel", handler, { passive: true });
     return () => {
       window.removeEventListener("pointerdown", handler);
       window.removeEventListener("keydown", handler);
       window.removeEventListener("touchstart", handler);
+      window.removeEventListener("scroll", handler);
+      window.removeEventListener("wheel", handler);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
